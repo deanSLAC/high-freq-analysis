@@ -6,6 +6,7 @@ optionally bin, see raw plot + FFT.
 Launch:  panel serve app.py --show --port 5009
 """
 
+import io
 import traceback
 from pathlib import Path
 
@@ -127,6 +128,16 @@ class RawViewer:
         )
         self.normalize_checkbox.param.watch(self._on_view_change, 'value')
 
+        self.concat_checkbox = pn.widgets.Checkbox(
+            name='Concatenate prefix cols end-to-end (off = overlaid)',
+            value=False,
+        )
+        self.plot_all_button = pn.widgets.Button(
+            name='Plot All', button_type='default',
+            sizing_mode='stretch_width',
+        )
+        self.plot_all_button.on_click(self._on_plot_all)
+
         self.status_pane = pn.pane.Markdown(
             "**Status:** Ready", sizing_mode='stretch_width',
             styles={'word-wrap': 'break-word'},
@@ -136,6 +147,16 @@ class RawViewer:
             "", sizing_mode='stretch_width',
             styles={'font-size': '0.8em', 'background': '#f8f9fa',
                     'padding': '8px', 'border-radius': '4px'},
+        )
+
+        self.prefix_plot_pane = pn.Column(
+            pn.pane.Markdown(
+                "*Click **Plot All** in the sidebar to render every column "
+                "sharing the selected column's prefix. (May be heavy.)*",
+                styles={'color': '#6c757d', 'padding': '40px 20px',
+                        'text-align': 'center'},
+            ),
+            sizing_mode='stretch_width',
         )
 
         self.signal_plot_pane = pn.Column(
@@ -164,6 +185,22 @@ class RawViewer:
                 'Frequency (Hz)': {'type': 'plaintext'},
                 'Amplitude': {'type': 'plaintext'},
             },
+        )
+
+        # --- Export widgets ---
+        self.export_prefix_checkbox = pn.widgets.CheckBoxGroup(
+            name='Column prefixes', options=[], value=[],
+            sizing_mode='stretch_width',
+        )
+        self.export_format = pn.widgets.RadioBoxGroup(
+            name='Format', options=['CSV', 'JSON'], value='CSV',
+            inline=True,
+        )
+        self.export_format.param.watch(self._on_export_format_change, 'value')
+        self.export_button = pn.widgets.FileDownload(
+            label='Export', button_type='primary',
+            filename='export.csv', callback=self._build_export,
+            sizing_mode='stretch_width', embed=False,
         )
 
         # --- Mode Evolution tab widgets ---
@@ -223,6 +260,8 @@ class RawViewer:
                 self.column_select,
                 self.binning_input,
                 self.normalize_checkbox,
+                self.concat_checkbox,
+                self.plot_all_button,
             ),
             title='2. View',
             collapsible=False,
@@ -238,12 +277,36 @@ class RawViewer:
             sizing_mode='stretch_width',
         )
 
+        export_card = pn.Card(
+            pn.Column(
+                pn.pane.Markdown(
+                    "Column prefixes",
+                    styles={'font-size': '0.85em', 'color': '#495057',
+                            'margin-bottom': '0'},
+                ),
+                self.export_prefix_checkbox,
+                pn.pane.Markdown(
+                    "Format",
+                    styles={'font-size': '0.85em', 'color': '#495057',
+                            'margin-bottom': '0'},
+                ),
+                self.export_format,
+                self.export_button,
+            ),
+            title='Export',
+            collapsible=False,
+            styles={'background': 'white', 'border': '1px solid #e9ecef'},
+            sizing_mode='stretch_width',
+        )
+
         sidebar = pn.Column(
-            data_card, view_card, status_card,
+            data_card, view_card, export_card, status_card,
             sizing_mode='stretch_width',
         )
 
         single_file_tab = pn.Column(
+            pn.pane.Markdown("### All columns sharing prefix"),
+            self.prefix_plot_pane,
             pn.pane.Markdown("### Signal"),
             self.signal_plot_pane,
             pn.pane.Markdown("### FFT"),
@@ -359,6 +422,18 @@ class RawViewer:
         elif plot_cols:
             self.column_select.value = plot_cols[0]
 
+        prefixes = sorted({str(c).split('_')[0] for c in plot_cols})
+        self.export_prefix_checkbox.options = prefixes
+        self.export_prefix_checkbox.value = list(prefixes)
+        self._on_export_format_change()
+
+        self.prefix_plot_pane.objects = [pn.pane.Markdown(
+            "*Click **Plot All** in the sidebar to render every column "
+            "sharing the selected column's prefix. (May be heavy.)*",
+            styles={'color': '#6c757d', 'padding': '40px 20px',
+                    'text-align': 'center'},
+        )]
+
         rows, cols = df.shape
         duration = rows / self._sampling_rate
         info_html = (
@@ -384,6 +459,63 @@ class RawViewer:
         if self._df is None:
             return
         self._update_plots()
+
+    def _on_plot_all(self, event=None):
+        if self._df is None:
+            self.prefix_plot_pane.objects = [pn.pane.Markdown(
+                "*Load a file first.*",
+                styles={'color': '#6c757d', 'padding': '20px',
+                        'text-align': 'center'},
+            )]
+            return
+        try:
+            self._update_prefix_plot()
+        except Exception as e:
+            self.prefix_plot_pane.objects = [pn.pane.Markdown(
+                f"**Plot error:** {e}",
+                styles={'color': '#dc3545', 'padding': '20px'},
+            )]
+            traceback.print_exc()
+
+    # ------------------------------------------------------------------
+    # Export callbacks
+    # ------------------------------------------------------------------
+
+    def _on_export_format_change(self, event=None):
+        ext = 'csv' if self.export_format.value == 'CSV' else 'json'
+        base = (self._current_file or 'export').rsplit('.pickle', 1)[0]
+        self.export_button.filename = f"{base}.{ext}"
+
+    def _build_export(self):
+        if self._df is None:
+            return io.StringIO("")
+
+        selected = set(self.export_prefix_checkbox.value or [])
+        cols = [c for c in self._df.columns
+                if c not in HIDDEN_COLS
+                and str(c).split('_')[0] in selected]
+        if not cols:
+            return io.StringIO("")
+
+        binning = max(int(self.binning_input.value or 1), 1)
+
+        sub = pd.DataFrame(
+            {c: pd.to_numeric(self._df[c], errors='coerce') for c in cols}
+        )
+        if binning > 1 and len(sub) >= binning:
+            n = (len(sub) // binning) * binning
+            sub = sub.iloc[:n]
+            sub = sub.groupby(np.arange(n) // binning).mean()
+            sub.reset_index(drop=True, inplace=True)
+
+        if self.export_format.value == 'CSV':
+            buf = io.StringIO()
+            sub.to_csv(buf, index=False)
+        else:
+            buf = io.StringIO()
+            sub.to_json(buf, orient='records')
+        buf.seek(0)
+        return buf
 
     # ------------------------------------------------------------------
     # Mode Evolution callback
@@ -555,6 +687,78 @@ class RawViewer:
     # ------------------------------------------------------------------
     # Plotting
     # ------------------------------------------------------------------
+
+    def _update_prefix_plot(self):
+        col = self.column_select.value
+        if not col or self._df is None:
+            return
+        prefix = str(col).split('_')[0]
+        cols = [c for c in self._df.columns
+                if c not in HIDDEN_COLS
+                and str(c).split('_')[0] == prefix]
+        if not cols:
+            self.prefix_plot_pane.objects = [pn.pane.Markdown(
+                f"*No columns share prefix `{prefix}`.*",
+                styles={'color': '#6c757d', 'padding': '20px',
+                        'text-align': 'center'},
+            )]
+            return
+
+        binning = max(int(self.binning_input.value or 1), 1)
+        fs = self._sampling_rate / binning
+
+        binned = {}
+        for c in cols:
+            values = pd.to_numeric(self._df[c], errors='coerce') \
+                .dropna().to_numpy(dtype=float)
+            if binning > 1 and len(values) >= binning:
+                m = (len(values) // binning) * binning
+                values = values[:m].reshape(-1, binning).mean(axis=1)
+            if len(values):
+                binned[c] = values
+
+        if not binned:
+            self.prefix_plot_pane.objects = [pn.pane.Markdown(
+                "*No numeric data for this prefix.*",
+                styles={'color': '#6c757d', 'padding': '20px',
+                        'text-align': 'center'},
+            )]
+            return
+
+        concat = bool(self.concat_checkbox.value)
+        frames = []
+        offset = 0.0
+        for c in cols:
+            if c not in binned:
+                continue
+            v = binned[c]
+            t = (offset + np.arange(len(v))) / fs if concat \
+                else np.arange(len(v)) / fs
+            if concat:
+                offset += len(v)
+            frames.append(pd.DataFrame(
+                {'time (s)': t, 'value': v, 'col': c}))
+        long_df = pd.concat(frames, ignore_index=True)
+
+        mode_str = 'end to end' if concat else 'overlaid'
+        bin_str = f' (binning {binning}, fs={fs:,.1f} Hz)' if binning > 1 \
+                  else f' (fs={fs:,.0f} Hz)'
+        try:
+            plot = long_df.hvplot(
+                x='time (s)', y='value', by='col',
+                title=f'{prefix}_* — {mode_str}{bin_str}',
+                xlabel='time (s)', ylabel=prefix,
+                height=350, shared_axes=False,
+            ).opts(width=900, shared_axes=False, hooks=[autorange_hook])
+            self.prefix_plot_pane.objects = [pn.pane.HoloViews(
+                plot, sizing_mode='stretch_width', height=375,
+                linked_axes=False,
+            )]
+        except Exception as e:
+            self.prefix_plot_pane.objects = [pn.pane.Markdown(
+                f"**Plot error:** {e}",
+                styles={'color': '#dc3545', 'padding': '20px'},
+            )]
 
     def _binned_signal(self, col):
         """Return (time, values, effective_sampling_rate) for the column,

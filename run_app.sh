@@ -4,11 +4,13 @@
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
-# Activate virtual environment if it exists
-if [ -d "../venv" ]; then
-    source ../venv/bin/activate
-elif [ -d "venv" ]; then
+# Activate virtual environment — prefer the project venv (numpy 2.x) over
+# the parent ../venv (which may be on numpy 1.x and fail to unpickle files
+# saved with numpy 2.x — "No module named 'numpy._core.numeric'").
+if [ -d "venv" ]; then
     source venv/bin/activate
+elif [ -d "../venv" ]; then
+    source ../venv/bin/activate
 fi
 
 # Pick a bind address: BIND_ADDR env var > beamline IP if locally assigned > localhost.
